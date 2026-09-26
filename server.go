@@ -1,4 +1,4 @@
-package ess
+package main
 
 import (
 	"context"
@@ -12,6 +12,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/andreimerlescu/naddr/ess"
+)
+
+const (
+	DefaultListenAddr = "127.0.0.1:8080"
+	EnvListenAddr     = "NADDR_LISTEN"
 )
 
 var gracefulShutdownTimeout = 5 * time.Second
@@ -20,27 +27,15 @@ var (
 	listenTCP = func(network, address string) (net.Listener, error) {
 		return net.Listen(network, address)
 	}
+
 	notifyContext = signal.NotifyContext
+	getenv        = os.Getenv
 )
 
-func runServer() error {
-	dataPath := strings.TrimSpace(getenv(EnvDataPath))
-	if dataPath == "" {
-		dataPath = DefaultDataPath
+func runServer(resolver *ess.Resolver) error {
+	if resolver == nil {
+		return ess.ErrNilResolver
 	}
-
-	started := time.Now()
-	resolver, err := Open(dataPath)
-	if err != nil {
-		return fmt.Errorf(
-			"load IPtoASN database %q: %w; download %s, extract it, or set %s",
-			dataPath,
-			err,
-			IPtoASNDataURL,
-			EnvDataPath,
-		)
-	}
-	loadTime := time.Since(started)
 
 	addr := strings.TrimSpace(getenv(EnvListenAddr))
 	if addr == "" {
@@ -54,19 +49,22 @@ func runServer() error {
 
 	srv := NewHTTPServer(addr, NewHandler(resolver))
 
-	ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := notifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 	defer stop()
 
 	stats := resolver.Stats()
+
 	slog.Info(
 		"naddr ready",
 		"listen", ln.Addr().String(),
-		"data", dataPath,
 		"ipv4_ranges", stats.IPv4Ranges,
 		"ipv6_ranges", stats.IPv6Ranges,
 		"asn_metadata", stats.ASNMetadata,
 		"descriptions", stats.Descriptions,
-		"load_ms", float64(loadTime.Microseconds())/1000,
 	)
 
 	return serveUntilDone(ctx, srv, ln)
@@ -93,8 +91,13 @@ func newHTTPServer(addr string, handler http.Handler) *http.Server {
 	return NewHTTPServer(addr, handler)
 }
 
-func serveUntilDone(ctx context.Context, srv *http.Server, ln net.Listener) error {
+func serveUntilDone(
+	ctx context.Context,
+	srv *http.Server,
+	ln net.Listener,
+) error {
 	errc := make(chan error, 1)
+
 	go func() {
 		errc <- srv.Serve(ln)
 	}()
@@ -107,7 +110,11 @@ func serveUntilDone(ctx context.Context, srv *http.Server, ln net.Listener) erro
 		return err
 
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
+		shutdownCtx, cancel := context.WithTimeout(
+			context.Background(),
+			gracefulShutdownTimeout,
+		)
+
 		shutdownErr := srv.Shutdown(shutdownCtx)
 		cancel()
 
@@ -116,9 +123,11 @@ func serveUntilDone(ctx context.Context, srv *http.Server, ln net.Listener) erro
 		}
 
 		<-errc
+
 		if shutdownErr != nil {
 			return shutdownErr
 		}
+
 		return nil
 	}
 }

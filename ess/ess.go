@@ -1,35 +1,24 @@
 package ess
 
 import (
-	"log/slog"
+	"fmt"
 	"os"
+	"strings"
 )
 
 const (
 	// DefaultDataPath is the default external IPtoASN TSV path used by ES.
 	DefaultDataPath = "tsv/ip2asn-combined.tsv"
 
-	// DefaultListenAddr is the default HTTP listen address used by ES.
-	DefaultListenAddr = "127.0.0.1:8080"
-
-	// EnvDataPath overrides DefaultDataPath for the naddr server.
+	// EnvDataPath overrides DefaultDataPath.
 	EnvDataPath = "NADDR_DATA"
-
-	// EnvListenAddr overrides DefaultListenAddr for the naddr server.
-	EnvListenAddr = "NADDR_LISTEN"
 
 	// IPtoASNDataURL is the upstream compressed database URL shown in errors.
 	// The ess package intentionally does not download it automatically.
 	IPtoASNDataURL = "https://iptoasn.com/data/ip2asn-combined.tsv.gz"
 )
 
-var (
-	getenv         = os.Getenv
-	exitProcess    = os.Exit
-	runApplication = runServer
-)
-
-// ES is intentionally the only function called by main().
+// ES loads the default external IPtoASN database and returns its Resolver.
 //
 // repository nattr
 //
@@ -37,9 +26,22 @@ var (
 //	   func         ES
 //	                   => nattr ess ES
 //	                                   => nAddresses
-func ES() {
-	if err := runApplication(); err != nil {
-		slog.Error("naddr stopped", "error", err)
-		exitProcess(1)
+func ES() (*Resolver, error) {
+	dataPath := strings.TrimSpace(os.Getenv(EnvDataPath))
+	if dataPath == "" {
+		dataPath = DefaultDataPath
 	}
+
+	resolver, err := Open(dataPath)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"load IPtoASN database %q: %w; download %s, extract it, or set %s",
+			dataPath,
+			err,
+			IPtoASNDataURL,
+			EnvDataPath,
+		)
+	}
+
+	return resolver, nil
 }

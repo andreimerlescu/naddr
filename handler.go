@@ -1,4 +1,4 @@
-package ess
+package main
 
 import (
 	"encoding/json"
@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+
+	"github.com/andreimerlescu/naddr/ess"
 )
 
 type ipResponse struct {
@@ -32,7 +34,7 @@ type boolResponse struct {
 }
 
 // NewHandler returns the HTTP API backed by resolver.
-func NewHandler(resolver *Resolver) http.Handler {
+func NewHandler(resolver *ess.Resolver) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/ip", getOnly(func(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +44,7 @@ func NewHandler(resolver *Resolver) http.Handler {
 			return
 		}
 
-		addr, err := ParseAddr(addrText)
+		addr, err := ess.ParseAddr(addrText)
 		if err != nil {
 			writeIPError(w, http.StatusBadRequest, err.Error())
 			return
@@ -57,6 +59,7 @@ func NewHandler(resolver *Resolver) http.Handler {
 			writeIPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+
 		writeLookup(w, resolver, addr, "no-store")
 	}))
 
@@ -67,13 +70,16 @@ func NewHandler(resolver *Resolver) http.Handler {
 			return
 		}
 
-		addr, err := ParseAddr(addrText)
+		addr, err := ess.ParseAddr(addrText)
 		if err != nil {
 			writeBoolError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
-		prefix, err := ParseMembershipPrefix(addr, strings.TrimSpace(r.URL.Query().Get("in")))
+		prefix, err := ess.ParseMembershipPrefix(
+			addr,
+			strings.TrimSpace(r.URL.Query().Get("in")),
+		)
 		if err != nil {
 			writeBoolError(w, http.StatusBadRequest, err.Error())
 			return
@@ -86,15 +92,30 @@ func NewHandler(resolver *Resolver) http.Handler {
 	}))
 
 	mux.HandleFunc("/healthz", getOnly(func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, "no-store", boolResponse{Success: true})
+		writeJSON(
+			w,
+			http.StatusOK,
+			"no-store",
+			boolResponse{Success: true},
+		)
 	}))
 
 	mux.HandleFunc("/readyz", getOnly(func(w http.ResponseWriter, _ *http.Request) {
-		if resolver == nil || resolver.db == nil {
-			writeBoolError(w, http.StatusServiceUnavailable, "database not loaded")
+		if !resolverReady(resolver) {
+			writeBoolError(
+				w,
+				http.StatusServiceUnavailable,
+				"database not loaded",
+			)
 			return
 		}
-		writeJSON(w, http.StatusOK, "no-store", boolResponse{Success: true})
+
+		writeJSON(
+			w,
+			http.StatusOK,
+			"no-store",
+			boolResponse{Success: true},
+		)
 	}))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -104,31 +125,43 @@ func NewHandler(resolver *Resolver) http.Handler {
 	return mux
 }
 
-// newHandler retains the package-private test/API shape used by the original
-// implementation while routing through the public Resolver abstraction.
-func newHandler(db *database) http.Handler {
-	return NewHandler(&Resolver{db: db})
+func resolverReady(resolver *ess.Resolver) bool {
+	if resolver == nil {
+		return false
+	}
+
+	stats := resolver.Stats()
+
+	return stats.IPv4Ranges+stats.IPv6Ranges > 0
 }
 
 func getOnly(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if r.Method != http.MethodGet &&
+			r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
-			writeBoolError(w, http.StatusMethodNotAllowed, "method not allowed")
+			writeBoolError(
+				w,
+				http.StatusMethodNotAllowed,
+				"method not allowed",
+			)
 			return
 		}
+
 		next(w, r)
 	}
 }
 
 func requesterAddr(r *http.Request) (netip.Addr, error) {
 	remoteText := r.RemoteAddr
+
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		remoteText = host
 	}
+
 	remoteText = strings.Trim(remoteText, "[]")
 
-	remote, err := ParseAddr(remoteText)
+	remote, err := ess.ParseAddr(remoteText)
 	if err != nil {
 		return netip.Addr{}, errors.New("invalid remote address")
 	}
@@ -140,14 +173,14 @@ func requesterAddr(r *http.Request) (netip.Addr, error) {
 	}
 
 	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
-		if addr, err := ParseAddr(realIP); err == nil {
+		if addr, err := ess.ParseAddr(realIP); err == nil {
 			return addr, nil
 		}
 	}
 
 	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
 		if first, _, _ := strings.Cut(forwarded, ","); strings.TrimSpace(first) != "" {
-			if addr, err := ParseAddr(strings.TrimSpace(first)); err == nil {
+			if addr, err := ess.ParseAddr(strings.TrimSpace(first)); err == nil {
 				return addr, nil
 			}
 		}
@@ -156,15 +189,28 @@ func requesterAddr(r *http.Request) (netip.Addr, error) {
 	return remote, nil
 }
 
-func writeLookup(w http.ResponseWriter, resolver *Resolver, addr netip.Addr, cacheControl string) {
-	if resolver == nil || resolver.db == nil {
-		writeIPError(w, http.StatusServiceUnavailable, "database not loaded")
+func writeLookup(
+	w http.ResponseWriter,
+	resolver *ess.Resolver,
+	addr netip.Addr,
+	cacheControl string,
+) {
+	if !resolverReady(resolver) {
+		writeIPError(
+			w,
+			http.StatusServiceUnavailable,
+			"database not loaded",
+		)
 		return
 	}
 
 	result, ok := resolver.Lookup(addr)
 	if !ok {
-		writeIPError(w, http.StatusNotFound, ErrAddressNotFound.Error())
+		writeIPError(
+			w,
+			http.StatusNotFound,
+			ess.ErrAddressNotFound.Error(),
+		)
 		return
 	}
 
@@ -178,6 +224,7 @@ func writeLookup(w http.ResponseWriter, resolver *Resolver, addr netip.Addr, cac
 		ASN:         result.ASN,
 		Description: result.Description,
 	}
+
 	if result.Version == 4 {
 		response.IP4 = result.Address.String()
 		response.Range4 = result.Range
@@ -185,30 +232,49 @@ func writeLookup(w http.ResponseWriter, resolver *Resolver, addr netip.Addr, cac
 		response.IP6 = result.Address.String()
 		response.Range6 = result.Range
 	}
+
 	writeJSON(w, http.StatusOK, cacheControl, response)
 }
 
-func writeIPError(w http.ResponseWriter, status int, message string) {
+func writeIPError(
+	w http.ResponseWriter,
+	status int,
+	message string,
+) {
 	writeJSON(w, status, "no-store", ipResponse{
 		Error:   stringPtr(message),
 		Success: false,
 	})
 }
 
-func writeBoolError(w http.ResponseWriter, status int, message string) {
+func writeBoolError(
+	w http.ResponseWriter,
+	status int,
+	message string,
+) {
 	writeJSON(w, status, "no-store", boolResponse{
 		Error:   stringPtr(message),
 		Success: false,
 	})
 }
 
-func stringPtr(s string) *string { return &s }
+func stringPtr(s string) *string {
+	return &s
+}
 
-func writeJSON(w http.ResponseWriter, status int, cacheControl string, value any) {
+func writeJSON(
+	w http.ResponseWriter,
+	status int,
+	cacheControl string,
+	value any,
+) {
 	h := w.Header()
+
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("Cache-Control", cacheControl)
 	h.Set("X-Content-Type-Options", "nosniff")
+
 	w.WriteHeader(status)
+
 	_ = json.NewEncoder(w).Encode(value)
 }

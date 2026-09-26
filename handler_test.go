@@ -1,4 +1,4 @@
-package ess
+package main
 
 import (
 	"net/http"
