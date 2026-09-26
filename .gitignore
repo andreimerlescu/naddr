@@ -8,3 +8,5 @@ logs/*
 !logs/.keep
 tsv/*
 !tsv/*.sample
+ess/tsv/*
+!ess/tsv/*.sample
