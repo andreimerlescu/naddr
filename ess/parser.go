@@ -3,20 +3,21 @@ package ess
 import (
 	"bufio"
 	"bytes"
+	"cmp"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
+	"slices"
+	"time"
 )
 
 const (
-	v4CapacityHint   = 540_000
-	v6CapacityHint   = 185_000
-	metaCapacityHint = 100_000
-	descCapacityHint = 100_000
-
 	prefix16Buckets = 1 << 16
 	maxTSVLineBytes = 64 << 10
+	tsvColumns      = 5
 )
 
 type database struct {
@@ -24,14 +25,21 @@ type database struct {
 	v6 []v6Range
 
 	// Prefix directories hold the first range whose start address is at or
-	// beyond each /16 boundary. lookupV4/lookupV6 also inspect the immediately
-	// preceding range because a range may cross a /16 boundary.
+	// beyond each /16 boundary. lookupV4/lookupV6 also inspect the
+	// immediately preceding range because a range may cross a /16 boundary.
 	v4Index [prefix16Buckets + 1]uint32
 	v6Index [prefix16Buckets + 1]uint32
 
 	// Ranges point to metadata instead of storing ASN data redundantly.
 	meta         []asnMeta
 	descriptions []string
+
+	// asns is sorted by ASN number and answers ASN-level IPv8 lookups.
+	asns []asnEntry
+
+	source   string
+	loadedAt time.Time
+	info     os.FileInfo
 }
 
 type databaseBuilder struct {
@@ -51,15 +59,27 @@ type asnMetaKey struct {
 	descID uint32
 }
 
+// loadDatabaseReader parses an IPtoASN TSV stream, transparently
+// decompressing gzip input.
 func loadDatabaseReader(r io.Reader) (*database, error) {
-	builder := newDatabaseBuilder()
 	br := bufio.NewReaderSize(r, maxTSVLineBytes)
+
+	if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		zr, err := gzip.NewReader(br)
+		if err != nil {
+			return nil, fmt.Errorf("open gzip stream: %w", err)
+		}
+		defer zr.Close()
+		br = bufio.NewReaderSize(zr, maxTSVLineBytes)
+	}
+
+	builder := newDatabaseBuilder()
 	lineNo := 0
 
 	for {
 		line, err := br.ReadSlice('\n')
 		if errors.Is(err, bufio.ErrBufferFull) {
-			return nil, fmt.Errorf("TSV line exceeds %d bytes", maxTSVLineBytes)
+			return nil, fmt.Errorf("line %d: TSV line exceeds %d bytes", lineNo+1, maxTSVLineBytes)
 		}
 
 		if len(line) > 0 {
@@ -84,28 +104,79 @@ func loadDatabaseReader(r io.Reader) (*database, error) {
 	return builder.finish(), nil
 }
 
+// newDatabaseBuilder deliberately does not preallocate for the full
+// IPtoASN dataset: library callers loading small or filtered data should
+// not pay for ~18 MB of capacity they never use.
 func newDatabaseBuilder() *databaseBuilder {
 	return &databaseBuilder{
-		db: &database{
-			v4:           make([]v4Range, 0, v4CapacityHint),
-			v6:           make([]v6Range, 0, v6CapacityHint),
-			meta:         make([]asnMeta, 0, metaCapacityHint),
-			descriptions: make([]string, 0, descCapacityHint),
-		},
-		descIDs: make(map[string]uint32, descCapacityHint),
-		metaIDs: make(map[asnMetaKey]uint32, metaCapacityHint),
+		db:      &database{},
+		descIDs: make(map[string]uint32),
+		metaIDs: make(map[asnMetaKey]uint32),
 	}
 }
 
 func (b *databaseBuilder) finish() *database {
 	buildV4Prefix16Index(b.db)
 	buildV6Prefix16Index(b.db)
+	b.buildASNIndex()
+	b.db.loadedAt = time.Now()
 
-	// The dedup maps are startup-only. Dropping references allows GC to reclaim
-	// them while the immutable compact slices remain live for serving requests.
+	// The dedup maps are startup-only. Dropping references allows GC to
+	// reclaim them while the immutable compact slices remain live.
 	b.descIDs = nil
 	b.metaIDs = nil
 	return b.db
+}
+
+// buildASNIndex records, per ASN, its most common metadata record and its
+// country when every range the ASN holds agrees on one.
+func (b *databaseBuilder) buildASNIndex() {
+	db := b.db
+
+	type countryAcc struct {
+		country uint16
+		mixed   bool
+	}
+
+	counts := make([]uint32, len(db.meta))
+	countries := make(map[uint32]countryAcc)
+
+	note := func(metaID uint32, country uint16) {
+		counts[metaID]++
+		asn := db.meta[metaID].number
+		acc, seen := countries[asn]
+		switch {
+		case !seen:
+			acc = countryAcc{country: country}
+		case acc.country != country:
+			acc.mixed = true
+		}
+		countries[asn] = acc
+	}
+	for _, r := range db.v4 {
+		note(r.metaID, r.country)
+	}
+	for _, r := range db.v6 {
+		note(r.metaID, r.country)
+	}
+
+	best := make(map[uint32]uint32, len(countries))
+	for id, m := range db.meta {
+		cur, ok := best[m.number]
+		if !ok || counts[id] > counts[cur] {
+			best[m.number] = uint32(id)
+		}
+	}
+
+	db.asns = make([]asnEntry, 0, len(best))
+	for asn, metaID := range best {
+		country := countryNone
+		if acc := countries[asn]; !acc.mixed {
+			country = acc.country
+		}
+		db.asns = append(db.asns, asnEntry{number: asn, metaID: metaID, country: country})
+	}
+	slices.SortFunc(db.asns, func(a, b asnEntry) int { return cmp.Compare(a.number, b.number) })
 }
 
 func (b *databaseBuilder) parseLine(line []byte, lineNo int) error {
@@ -116,28 +187,12 @@ func (b *databaseBuilder) parseLine(line []byte, lineNo int) error {
 		return nil
 	}
 
-	startField, rest, ok := cutTab(line)
+	cols, ok := splitColumns(line)
 	if !ok {
-		return fmt.Errorf("line %d: expected at least 5 TSV columns", lineNo)
+		return fmt.Errorf("line %d: expected at least %d tab-separated columns, got %d",
+			lineNo, tsvColumns, bytes.Count(line, []byte{'\t'})+1)
 	}
-	endField, rest, ok := cutTab(rest)
-	if !ok {
-		return fmt.Errorf("line %d: missing range_end", lineNo)
-	}
-	asnField, rest, ok := cutTab(rest)
-	if !ok {
-		return fmt.Errorf("line %d: missing AS_number", lineNo)
-	}
-	countryField, descriptionField, ok := cutTab(rest)
-	if !ok {
-		return fmt.Errorf("line %d: missing AS_description column", lineNo)
-	}
-
-	startField = bytes.TrimSpace(startField)
-	endField = bytes.TrimSpace(endField)
-	asnField = bytes.TrimSpace(asnField)
-	countryField = bytes.TrimSpace(countryField)
-	descriptionField = bytes.TrimSpace(descriptionField)
+	startField, endField, asnField, countryField, descriptionField := cols[0], cols[1], cols[2], cols[3], cols[4]
 
 	if bytes.Equal(startField, []byte("range_start")) {
 		return nil
@@ -210,10 +265,27 @@ func (b *databaseBuilder) parseLine(line []byte, lineNo int) error {
 	return nil
 }
 
+// splitColumns splits the first four tab-separated columns and returns the
+// remainder as the description, which may itself contain tabs.
+func splitColumns(line []byte) ([tsvColumns][]byte, bool) {
+	var cols [tsvColumns][]byte
+	rest := line
+	for i := 0; i < tsvColumns-1; i++ {
+		head, tail, ok := cutTab(rest)
+		if !ok {
+			return cols, false
+		}
+		cols[i] = bytes.TrimSpace(head)
+		rest = tail
+	}
+	cols[tsvColumns-1] = bytes.TrimSpace(rest)
+	return cols, true
+}
+
 func (b *databaseBuilder) internDescription(raw []byte) uint32 {
-	// The temporary []byte->string conversion used only for map probing does
-	// not escape in current Go compilers. Allocate a durable string only on a
-	// genuine miss so duplicate descriptions are stored exactly once.
+	// The temporary []byte->string conversion used only for map probing
+	// does not allocate in current Go compilers. A durable string is
+	// allocated only on a miss, so each description is stored once.
 	if id, ok := b.descIDs[string(raw)]; ok {
 		return id
 	}

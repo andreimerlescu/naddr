@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -17,6 +19,8 @@ const testTSV = "" +
 	"100.64.0.0\t100.64.0.255\t0\tNone\tNot routed\n" +
 	"2001:1948::\t2001:1948:ffff:ffff:ffff:ffff:ffff:ffff\t210\tUS\tInternet2\n"
 
+const testHost = "127.0.0.1:8080"
+
 func mustTestResolver(t testing.TB) *ess.Resolver {
 	t.Helper()
 
@@ -28,6 +32,29 @@ func mustTestResolver(t testing.TB) *ess.Resolver {
 	return resolver
 }
 
+func defaultHandlerOptions() HandlerOptions {
+	return HandlerOptions{
+		TrustedProxies: loopbackPrefixes(),
+		AllowedHosts:   defaultAllowedHosts("127.0.0.1"),
+		Logger:         discardLogger(),
+	}
+}
+
+func newTestHandler(t testing.TB) http.Handler {
+	t.Helper()
+	return NewHandler(mustTestResolver(t), defaultHandlerOptions())
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func mapEnv(m map[string]string) func(string) string {
+	return func(key string) string { return m[key] }
+}
+
+// request issues a request against h. A "Host" entry in headers sets
+// req.Host; otherwise the host is testHost so the allowlist passes.
 func request(
 	t *testing.T,
 	h http.Handler,
@@ -39,12 +66,17 @@ func request(
 	t.Helper()
 
 	req := httptest.NewRequest(method, target, nil)
+	req.Host = testHost
 
 	if remote != "" {
 		req.RemoteAddr = remote
 	}
 
 	for k, v := range headers {
+		if k == "Host" {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 

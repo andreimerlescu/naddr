@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -9,98 +10,119 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/andreimerlescu/naddr/ess"
 )
 
-const (
-	DefaultListenAddr = "127.0.0.1:8080"
-	EnvListenAddr     = "NADDR_LISTEN"
-)
-
-var gracefulShutdownTimeout = 5 * time.Second
-
 var (
-	listenTCP = func(network, address string) (net.Listener, error) {
-		return net.Listen(network, address)
-	}
-
-	notifyContext = signal.NotifyContext
-	getenv        = os.Getenv
+	listenTCP               = net.Listen
+	notifyContext           = signal.NotifyContext
+	gracefulShutdownTimeout = 5 * time.Second
 )
 
-func runServer(resolver *ess.Resolver) error {
+func runServer(cfg Config, resolver *ess.Resolver, logger *slog.Logger) error {
 	if resolver == nil {
 		return ess.ErrNilResolver
 	}
-
-	addr := strings.TrimSpace(getenv(EnvListenAddr))
-	if addr == "" {
-		addr = DefaultListenAddr
+	if logger == nil {
+		logger = slog.Default()
 	}
 
-	ln, err := listenTCP("tcp", addr)
+	ln, err := listenTCP("tcp", cfg.Listen)
 	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
+		return fmt.Errorf("listen on %s: %w", cfg.Listen, err)
 	}
 
-	srv := NewHTTPServer(addr, NewHandler(resolver))
+	useTLS := cfg.TLSCert != ""
+	handler := NewHandler(resolver, HandlerOptions{
+		TrustedProxies: cfg.TrustedProxies,
+		AllowedHosts:   cfg.AllowedHosts,
+		AccessLog:      cfg.AccessLog,
+		Logger:         logger,
+	})
+	srv := NewHTTPServer(cfg.Listen, handler, useTLS)
+	srv.ErrorLog = slog.NewLogLogger(logger.Handler(), slog.LevelWarn)
 
-	ctx, stop := notifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
+	ctx, stop := notifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	stats := resolver.Stats()
+	// Deferred in LIFO order: cancel the watcher, then wait for it to exit.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
 
-	slog.Info(
-		"naddr ready",
-		"listen", ln.Addr().String(),
-		"ipv4_ranges", stats.IPv4Ranges,
-		"ipv6_ranges", stats.IPv6Ranges,
-		"asn_metadata", stats.ASNMetadata,
-		"descriptions", stats.Descriptions,
-	)
+	wg.Go(func() {
+		err := resolver.Watch(watchCtx, ess.WatchOptions{
+			OnReload: func(s ess.Stats) {
+				logger.Info("naddr database reloaded", statsAttrs(s)...)
+			},
+			OnError: func(err error) {
+				logger.Error("naddr database reload failed; serving previous database", "error", err)
+			},
+		})
+		if err != nil && !errors.Is(err, ess.ErrNoSource) {
+			logger.Error("naddr database watcher stopped", "error", err)
+		}
+	})
 
-	return serveUntilDone(ctx, srv, ln)
+	serve := func() error { return srv.Serve(ln) }
+	if useTLS {
+		serve = func() error { return srv.ServeTLS(ln, cfg.TLSCert, cfg.TLSKey) }
+	}
+
+	attrs := []any{"version", BinaryVersion(), "listen", ln.Addr().String(), "tls", useTLS}
+	logger.Info("naddr ready", append(attrs, statsAttrs(resolver.Stats())...)...)
+
+	return serveUntilDone(ctx, srv, serve)
 }
 
-// NewHTTPServer applies the hardened HTTP server defaults used by naddr.
-func NewHTTPServer(addr string, handler http.Handler) *http.Server {
+func statsAttrs(s ess.Stats) []any {
+	return []any{
+		"source", s.Source,
+		"loaded_at", s.LoadedAt,
+		"ipv4_ranges", s.IPv4Ranges,
+		"ipv6_ranges", s.IPv6Ranges,
+		"asns", s.ASNs,
+		"reloads", s.Reloads,
+	}
+}
+
+// NewHTTPServer applies naddr's hardened server defaults. Without TLS it
+// serves HTTP/1.1 and cleartext HTTP/2 (h2c); with TLS, HTTP/1.1 and HTTP/2.
+func NewHTTPServer(addr string, handler http.Handler, useTLS bool) *http.Server {
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
-	protocols.SetUnencryptedHTTP2(true)
 
-	return &http.Server{
+	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 2 * time.Second,
+		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 		Protocols:         protocols,
 	}
+
+	if useTLS {
+		protocols.SetHTTP2(true)
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		protocols.SetUnencryptedHTTP2(true)
+	}
+
+	return srv
 }
 
-func newHTTPServer(addr string, handler http.Handler) *http.Server {
-	return NewHTTPServer(addr, handler)
-}
-
-func serveUntilDone(
-	ctx context.Context,
-	srv *http.Server,
-	ln net.Listener,
-) error {
+// serveUntilDone runs serve until it fails or ctx is canceled, then shuts
+// the server down gracefully.
+func serveUntilDone(ctx context.Context, srv *http.Server, serve func() error) error {
 	errc := make(chan error, 1)
-
-	go func() {
-		errc <- srv.Serve(ln)
-	}()
+	go func() { errc <- serve() }()
 
 	select {
 	case err := <-errc:
@@ -110,11 +132,7 @@ func serveUntilDone(
 		return err
 
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(
-			context.Background(),
-			gracefulShutdownTimeout,
-		)
-
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), gracefulShutdownTimeout)
 		shutdownErr := srv.Shutdown(shutdownCtx)
 		cancel()
 
@@ -122,12 +140,13 @@ func serveUntilDone(
 			_ = srv.Close()
 		}
 
-		<-errc
-
+		serveErr := <-errc
 		if shutdownErr != nil {
 			return shutdownErr
 		}
-
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return serveErr
+		}
 		return nil
 	}
 }

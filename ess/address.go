@@ -4,78 +4,84 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
-	"strconv"
 	"strings"
 )
 
-// ParseAddr parses an IP address, rejects scoped IPv6 addresses, and normalizes
-// IPv4-mapped IPv6 addresses to IPv4.
+var (
+	// ErrInvalidAddress is returned when input is not a valid IP address.
+	ErrInvalidAddress = errors.New("invalid IP address")
+
+	// ErrScopedAddress is returned for IPv6 addresses carrying a zone.
+	ErrScopedAddress = errors.New("scoped IPv6 addresses are not supported")
+)
+
+// ParseAddr parses an IPv4 or IPv6 address, rejects scoped IPv6 addresses,
+// and normalizes IPv4-mapped IPv6 addresses to IPv4.
 func ParseAddr(s string) (netip.Addr, error) {
 	addr, err := netip.ParseAddr(strings.TrimSpace(s))
 	if err != nil {
-		return netip.Addr{}, errors.New("invalid IP address")
+		return netip.Addr{}, ErrInvalidAddress
 	}
 	if addr.Zone() != "" {
-		return netip.Addr{}, errors.New("scoped IPv6 addresses are not supported")
+		return netip.Addr{}, ErrScopedAddress
 	}
 	return addr.Unmap(), nil
 }
 
-// ParseMembershipPrefix accepts ip/cidr, /cidr, or cidr forms. For the latter
-// two forms the prefix is constructed around addr.
+// ParseMembershipPrefix accepts ip/cidr, /cidr, or cidr. The latter two
+// build the prefix around addr, which is useful for finding the network
+// that contains addr (and always contains it).
 func ParseMembershipPrefix(addr netip.Addr, spec string) (netip.Prefix, error) {
 	if !addr.IsValid() || addr.Zone() != "" {
-		return netip.Prefix{}, errors.New("invalid IP address")
+		return netip.Prefix{}, ErrInvalidAddress
 	}
 	addr = addr.Unmap()
+
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return netip.Prefix{}, errors.New("missing in")
 	}
 
-	if strings.HasPrefix(spec, "/") {
-		bitsN, err := strconv.Atoi(strings.TrimPrefix(spec, "/"))
+	if bitsText, relative := relativeBits(spec); relative {
+		bits, err := parsePrefixBits(bitsText, addr.BitLen())
 		if err != nil {
-			return netip.Prefix{}, errors.New("invalid CIDR prefix length")
+			return netip.Prefix{}, err
 		}
-		return prefixFromBits(addr, bitsN)
+		return netip.PrefixFrom(addr, bits).Masked(), nil
 	}
 
-	if !strings.Contains(spec, "/") {
-		bitsN, err := strconv.Atoi(spec)
-		if err != nil {
-			return netip.Prefix{}, errors.New("in must be ip/cidr, /cidr, or cidr")
-		}
-		return prefixFromBits(addr, bitsN)
-	}
-
-	prefix, err := netip.ParsePrefix(spec)
+	parsed, err := netip.ParsePrefix(spec)
 	if err != nil {
 		return netip.Prefix{}, errors.New("invalid CIDR")
 	}
-	prefixAddr := prefix.Addr().Unmap()
-	if prefixAddr.Is4() != addr.Is4() {
+	prefix, ok := normalizePrefix(parsed)
+	if !ok {
+		return netip.Prefix{}, errors.New("invalid CIDR")
+	}
+	if prefix.Addr().Is4() != addr.Is4() {
 		return netip.Prefix{}, errors.New("IP and CIDR address families differ")
 	}
-	return netip.PrefixFrom(prefixAddr, prefix.Bits()).Masked(), nil
+	return prefix, nil
 }
 
-// Contains reports whether addr is contained by prefix after normalizing
-// IPv4-mapped IPv6 addresses. Different address families return false.
+// Contains reports whether addr is inside prefix after normalizing
+// IPv4-mapped forms. Different address families return false.
 func Contains(addr netip.Addr, prefix netip.Prefix) bool {
-	if !addr.IsValid() || !prefix.IsValid() || addr.Zone() != "" || prefix.Addr().Zone() != "" {
+	if !addr.IsValid() || addr.Zone() != "" {
+		return false
+	}
+	p, ok := normalizePrefix(prefix)
+	if !ok {
 		return false
 	}
 	addr = addr.Unmap()
-	prefixAddr := prefix.Addr().Unmap()
-	if addr.Is4() != prefixAddr.Is4() {
+	if addr.Is4() != p.Addr().Is4() {
 		return false
 	}
-	normalized := netip.PrefixFrom(prefixAddr, prefix.Bits()).Masked()
-	return normalized.Contains(addr)
+	return p.Contains(addr)
 }
 
-// In parses addrText and spec and reports CIDR membership in one call.
+// In parses addrText and spec and reports IPv4/IPv6 CIDR membership.
 func In(addrText, spec string) (bool, error) {
 	addr, err := ParseAddr(addrText)
 	if err != nil {
@@ -88,19 +94,110 @@ func In(addrText, spec string) (bool, error) {
 	return prefix.Contains(addr), nil
 }
 
-func prefixFromBits(addr netip.Addr, n int) (netip.Prefix, error) {
-	maxBits := 128
-	if addr.Is4() {
-		maxBits = 32
-	}
-	if n < 0 || n > maxBits {
-		return netip.Prefix{}, fmt.Errorf("CIDR prefix length must be between 0 and %d", maxBits)
-	}
-	return netip.PrefixFrom(addr, n).Masked(), nil
+// Membership is the answer to a CIDR membership check.
+type Membership struct {
+	// Version is 4, 6, or 8: the family of the checked address.
+	Version int
+	// Member reports whether the address is inside Network.
+	Member bool
+	// Network is the normalized network the address was tested against.
+	Network string
 }
 
-// Backward-compatible internal names retained for package tests and HTTP code.
-func parseRequestAddr(s string) (netip.Addr, error) { return ParseAddr(s) }
-func parseMembershipPrefix(addr netip.Addr, spec string) (netip.Prefix, error) {
-	return ParseMembershipPrefix(addr, spec)
+// Check parses an IPv4, IPv6, or IPv8 address and a network spec and
+// reports membership along with the normalized network. See
+// ParseMembershipPrefix and ParseMembershipPrefix8 for accepted specs.
+func Check(addrText, spec string) (Membership, error) {
+	addr, err := ParseAddr(addrText)
+	if err == nil {
+		prefix, err := ParseMembershipPrefix(addr, spec)
+		if err != nil {
+			return Membership{}, err
+		}
+		version := 6
+		if addr.Is4() {
+			version = 4
+		}
+		return Membership{Version: version, Member: prefix.Contains(addr), Network: prefix.String()}, nil
+	}
+	if !errors.Is(err, ErrInvalidAddress) {
+		return Membership{}, err
+	}
+
+	a8, err := ParseAddr8(addrText)
+	if err != nil {
+		return Membership{}, ErrInvalidAddress
+	}
+	prefix, err := ParseMembershipPrefix8(a8, spec)
+	if err != nil {
+		return Membership{}, err
+	}
+	return Membership{Version: 8, Member: prefix.Contains(a8), Network: prefix.String()}, nil
+}
+
+// ParseMembershipPrefix8 accepts an IPv8 prefix in either form (see
+// ParsePrefix8), or /bits or bits (0-64) relative to a.
+func ParseMembershipPrefix8(a Addr8, spec string) (Prefix8, error) {
+	if !a.IsValid() {
+		return Prefix8{}, ErrInvalidAddr8
+	}
+
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return Prefix8{}, errors.New("missing in")
+	}
+
+	if bitsText, relative := relativeBits(spec); relative {
+		bits, err := parsePrefixBits(bitsText, 64)
+		if err != nil {
+			return Prefix8{}, err
+		}
+		return Prefix8From(a, bits)
+	}
+
+	return ParsePrefix8(spec)
+}
+
+func relativeBits(spec string) (string, bool) {
+	if strings.HasPrefix(spec, "/") {
+		return spec[1:], true
+	}
+	if !strings.Contains(spec, "/") {
+		return spec, true
+	}
+	return "", false
+}
+
+func parsePrefixBits(s string, maxBits int) (int, error) {
+	if s == "" || len(s) > 3 {
+		return 0, errors.New("invalid CIDR prefix length")
+	}
+	n := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < '0' || c > '9' {
+			return 0, errors.New("invalid CIDR prefix length")
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n > maxBits {
+		return 0, fmt.Errorf("CIDR prefix length must be between 0 and %d", maxBits)
+	}
+	return n, nil
+}
+
+// normalizePrefix unmaps IPv4-mapped IPv6 prefixes (::ffff:a.b.c.d/n with
+// n >= 96) to IPv4 and masks host bits.
+func normalizePrefix(p netip.Prefix) (netip.Prefix, bool) {
+	if !p.IsValid() || p.Addr().Zone() != "" {
+		return netip.Prefix{}, false
+	}
+	addr, bits := p.Addr(), p.Bits()
+	if addr.Is4In6() {
+		if bits < 96 {
+			return netip.Prefix{}, false
+		}
+		addr, bits = addr.Unmap(), bits-96
+	}
+	return netip.PrefixFrom(addr, bits).Masked(), true
 }

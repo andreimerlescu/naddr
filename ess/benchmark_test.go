@@ -7,24 +7,45 @@ import (
 )
 
 func BenchmarkLookupIPv4(b *testing.B) {
-	resolver := mustTestResolver(b)
+	db := mustTestResolver(b).current()
 	target := ipv4Uint32(netip.MustParseAddr("64.23.184.179"))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, ok := resolver.db.lookupV4(target); !ok {
+	for b.Loop() {
+		if _, ok := db.lookupV4(target); !ok {
 			b.Fatal("lookup miss")
 		}
 	}
 }
 
 func BenchmarkLookupIPv6(b *testing.B) {
-	resolver := mustTestResolver(b)
+	db := mustTestResolver(b).current()
 	target := uint128FromAddr(netip.MustParseAddr("2001:1948:e00:1001::2"))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, ok := resolver.db.lookupV6(target); !ok {
+	for b.Loop() {
+		if _, ok := db.lookupV6(target); !ok {
+			b.Fatal("lookup miss")
+		}
+	}
+}
+
+// BenchmarkLookupString measures the full public path: parsing, lookup,
+// and building the Result, including IPv8 derivation.
+func BenchmarkLookupString(b *testing.B) {
+	resolver := mustTestResolver(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := resolver.LookupString("64.23.184.179"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkLookupAddr8(b *testing.B) {
+	resolver := mustTestResolver(b)
+	target := mustAddr8(b, "14061.10.0.0.1")
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, ok := resolver.LookupAddr8(target); !ok {
 			b.Fatal("lookup miss")
 		}
 	}
@@ -41,13 +62,12 @@ func BenchmarkLoadExternalDatabase(b *testing.B) {
 	}
 	b.SetBytes(info.Size())
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		resolver, err := Open(path)
 		if err != nil {
 			b.Fatal(err)
 		}
-		if stats := resolver.Stats(); stats.IPv4Ranges+stats.IPv6Ranges == 0 {
+		if !resolver.Ready() {
 			b.Fatal("empty database")
 		}
 	}
