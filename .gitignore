@@ -1,0 +1,8 @@
+.DS_Store
+.idea/
+summaries/
+lemmings/
+bin/
+*.log
+logs/*
+!logs/.keep
