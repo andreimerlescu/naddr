@@ -1,4 +1,4 @@
-package main
+package ess
 
 import (
 	"context"
@@ -18,9 +18,11 @@ import (
 )
 
 const testTSV = `range_start	range_end	AS_number	country_code	AS_description
-45.138.12.0	45.138.12.255	218785	LT	TEST-LT
-64.23.176.0	64.23.191.255	14061	US	TEST-US
-2001:1948::	2001:1948:ffff:ffff:ffff:ffff:ffff:ffff	210	US	TEST-V6
+45.138.12.0	45.138.12.255	218785	LT	UAB Cherry Servers
+64.23.176.0	64.23.191.255	14061	US	DIGITALOCEAN-ASN
+64.24.0.0	64.24.0.255	14061	US	DIGITALOCEAN-ASN
+100.64.0.0	100.64.0.255	0	None	Not routed
+2001:1948::	2001:1948:ffff:ffff:ffff:ffff:ffff:ffff	210	US	Internet2
 `
 
 func mustTestDB(t testing.TB) *database {
@@ -63,8 +65,9 @@ func TestLookupIPv4AndIPv6(t *testing.T) {
 	if !ok {
 		t.Fatal("IPv4 lookup missed")
 	}
-	if r4.asn != 218785 || countryName(r4.country) != "Lithuania" || formatV4Range(r4) != "45.138.12.0/24" {
-		t.Fatalf("unexpected IPv4 result: %+v %q %q", r4, countryName(r4.country), formatV4Range(r4))
+	m4 := db.metadata(r4.metaID)
+	if m4.number != 218785 || db.description(m4) != "UAB Cherry Servers" || countryName(r4.country) != "Lithuania" || formatV4Range(r4) != "45.138.12.0/24" {
+		t.Fatalf("unexpected IPv4 result: %+v %+v %q %q", r4, m4, countryName(r4.country), formatV4Range(r4))
 	}
 
 	v6 := netip.MustParseAddr("2001:1948:e00:1001::2")
@@ -72,8 +75,9 @@ func TestLookupIPv4AndIPv6(t *testing.T) {
 	if !ok {
 		t.Fatal("IPv6 lookup missed")
 	}
-	if r6.asn != 210 || countryName(r6.country) != "United States" || formatV6Range(r6) != "2001:1948::/32" {
-		t.Fatalf("unexpected IPv6 result: %+v %q %q", r6, countryName(r6.country), formatV6Range(r6))
+	m6 := db.metadata(r6.metaID)
+	if m6.number != 210 || db.description(m6) != "Internet2" || countryName(r6.country) != "United States" || formatV6Range(r6) != "2001:1948::/32" {
+		t.Fatalf("unexpected IPv6 result: %+v %+v %q %q", r6, m6, countryName(r6.country), formatV6Range(r6))
 	}
 
 	if _, ok := db.lookupV4(ipv4Uint32(netip.MustParseAddr("1.1.1.1"))); ok {
@@ -90,6 +94,70 @@ func TestLookupIPv4AndIPv6(t *testing.T) {
 	}
 }
 
+func TestMetadataDedupNoneAndPrefixIndexes(t *testing.T) {
+	db := mustTestDB(t)
+
+	if got, want := len(db.descriptions), 4; got != want {
+		t.Fatalf("descriptions = %d, want %d", got, want)
+	}
+	if got, want := len(db.meta), 4; got != want {
+		t.Fatalf("metadata records = %d, want %d", got, want)
+	}
+	if db.v4[1].metaID != db.v4[2].metaID {
+		t.Fatalf("duplicate ASN/description metadata was not deduplicated: %d != %d", db.v4[1].metaID, db.v4[2].metaID)
+	}
+
+	none := db.v4[3]
+	if none.country != countryNone || countryCode(none.country) != "None" || countryName(none.country) != "Unknown" {
+		t.Fatalf("None country semantics: id=%d code=%q name=%q", none.country, countryCode(none.country), countryName(none.country))
+	}
+	meta := db.metadata(none.metaID)
+	if meta.number != 0 || db.description(meta) != "Not routed" {
+		t.Fatalf("None metadata: %+v %q", meta, db.description(meta))
+	}
+
+	for _, raw := range []string{"None", "none", "nOnE"} {
+		code, err := parseCountryCode([]byte(raw))
+		if err != nil || code != countryNone {
+			t.Fatalf("parseCountryCode(%q) = %d, %v", raw, code, err)
+		}
+	}
+
+	crossV4, err := loadDatabaseReader(strings.NewReader(
+		"10.0.0.0\t10.1.255.255\t64500\tUS\tCross-v4\n" +
+			"10.2.0.0\t10.2.0.255\t64501\tUS\tNext-v4\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := crossV4.lookupV4(ipv4Uint32(netip.MustParseAddr("10.1.99.1"))); !ok || formatV4Range(r) != "10.0.0.0/15" {
+		t.Fatalf("cross-/16 IPv4 lookup: %+v ok=%v", r, ok)
+	}
+
+	sameBucketV4, err := loadDatabaseReader(strings.NewReader(
+		"10.3.0.0\t10.3.0.9\t1\tUS\tfirst\n" +
+			"10.3.0.20\t10.3.0.29\t2\tUS\tsecond\n" +
+			"10.3.0.40\t10.3.0.49\t3\tUS\tthird\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := sameBucketV4.lookupV4(ipv4Uint32(netip.MustParseAddr("10.3.0.5"))); !ok || r.start != ipv4Uint32(netip.MustParseAddr("10.3.0.0")) {
+		t.Fatalf("same-/16 IPv4 lookup: %+v ok=%v", r, ok)
+	}
+
+	crossV6, err := loadDatabaseReader(strings.NewReader(
+		"2000::\t2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff\t64510\tUS\tCross-v6\n" +
+			"2002::\t2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff\t64511\tUS\tNext-v6\n",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := crossV6.lookupV6(uint128FromAddr(netip.MustParseAddr("2001:db8::1"))); !ok || formatV6Range(r) != "2000::/15" {
+		t.Fatalf("cross-/16 IPv6 lookup: %+v ok=%v", r, ok)
+	}
+}
+
 func TestIPHandler(t *testing.T) {
 	h := newHandler(mustTestDB(t))
 
@@ -102,8 +170,10 @@ func TestIPHandler(t *testing.T) {
 		`"success":true`,
 		`"v":4`,
 		`"country":"Lithuania"`,
+		`"country_code":"LT"`,
 		`"n":218785`,
 		`"asn":"AS218785"`,
+		`"description":"UAB Cherry Servers"`,
 		`"ip4":"45.138.12.24"`,
 		`"range4":"45.138.12.0/24"`,
 	}
@@ -130,6 +200,14 @@ func TestIPHandler(t *testing.T) {
 		!strings.Contains(rec.Body.String(), `"asn":"AS210"`) ||
 		!strings.Contains(rec.Body.String(), `"range6":"2001:1948::/32"`) {
 		t.Fatalf("unexpected IPv6 response: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = request(t, h, http.MethodGet, "/ip?addr=100.64.0.1", nil, "")
+	if rec.Code != http.StatusOK ||
+		!strings.Contains(rec.Body.String(), `"country":"Unknown"`) ||
+		!strings.Contains(rec.Body.String(), `"country_code":"None"`) ||
+		!strings.Contains(rec.Body.String(), `"description":"Not routed"`) {
+		t.Fatalf("unexpected None-country response: %d %s", rec.Code, rec.Body.String())
 	}
 
 	cases := []struct {
@@ -266,7 +344,7 @@ func TestParserValidation(t *testing.T) {
 		{"empty-asn", "1.1.1.1\t1.1.1.2\t\tUS\tx\n", "empty integer"},
 		{"bad-asn", "1.1.1.1\t1.1.1.2\t1x\tUS\tx\n", "non-decimal integer"},
 		{"overflow-asn", "1.1.1.1\t1.1.1.2\t4294967296\tUS\tx\n", "exceeds uint32"},
-		{"short-country", "1.1.1.1\t1.1.1.2\t1\tU\tx\n", "exactly two letters"},
+		{"short-country", "1.1.1.1\t1.1.1.2\t1\tU\tx\n", "two-letter ISO code or None"},
 		{"bad-country", "1.1.1.1\t1.1.1.2\t1\tU1\tx\n", "alphabetic"},
 		{"reverse4", "1.1.1.2\t1.1.1.1\t1\tUS\tx\n", "reversed IPv4"},
 		{"overlap4", "1.1.1.0\t1.1.1.10\t1\tUS\tx\n1.1.1.10\t1.1.1.20\t2\tUS\tx\n", "IPv4 ranges are unsorted or overlapping"},
@@ -291,6 +369,45 @@ func TestParserValidation(t *testing.T) {
 	}
 	if got := countryName(db.v4[0].country); got != "United States" {
 		t.Fatalf("lowercase country normalization = %q", got)
+	}
+}
+
+func TestCountryCodeNoneNormalization(t *testing.T) {
+	cases := []string{"None", "none", "NONE", " None", "None ", "  nOnE  ", "\tNone\r\n"}
+	for _, raw := range cases {
+		code, err := parseCountryCode([]byte(raw))
+		if err != nil {
+			t.Fatalf("parseCountryCode(%q): %v", raw, err)
+		}
+		if code != countryNone {
+			t.Fatalf("parseCountryCode(%q) = %d, want countryNone", raw, code)
+		}
+		if got := countryCode(code); got != "None" {
+			t.Fatalf("countryCode(%q) = %q, want None", raw, got)
+		}
+		if got := countryName(code); got != "Unknown" {
+			t.Fatalf("countryName(%q) = %q, want Unknown", raw, got)
+		}
+	}
+
+	// Reproduce the upstream shape that exposed the bug: padded fields around
+	// ASN 0 / None / Not routed must load, not fail ISO alpha-2 validation.
+	db, err := loadDatabaseReader(strings.NewReader(
+		" 100.64.0.0 \t 100.127.255.255 \t 0 \t None \t Not routed \n",
+	))
+	if err != nil {
+		t.Fatalf("padded None TSV row rejected: %v", err)
+	}
+	r, ok := db.lookupV4(ipv4Uint32(netip.MustParseAddr("100.64.0.1")))
+	if !ok {
+		t.Fatal("padded None TSV row did not load")
+	}
+	if r.country != countryNone {
+		t.Fatalf("country = %d, want countryNone", r.country)
+	}
+	meta := db.metadata(r.metaID)
+	if meta.number != 0 || db.description(meta) != "Not routed" {
+		t.Fatalf("metadata = %+v description=%q", meta, db.description(meta))
 	}
 }
 
@@ -324,7 +441,7 @@ func TestReaderAndFSFailures(t *testing.T) {
 		dataPath: &fstest.MapFile{Data: []byte(testTSV)},
 	}
 	db, err := loadDatabaseFS(m, dataPath)
-	if err != nil || len(db.v4) != 2 || len(db.v6) != 1 {
+	if err != nil || len(db.v4) != 4 || len(db.v6) != 1 {
 		t.Fatalf("loadDatabaseFS valid: db=%v err=%v", db, err)
 	}
 }
@@ -387,6 +504,12 @@ func TestPrefixAndFormattingEdges(t *testing.T) {
 	if got := countryName(0x5151); got != "Unknown" {
 		t.Fatalf("unknown country = %q", got)
 	}
+	if got := countryCode(0x5553); got != "US" {
+		t.Fatalf("country code = %q", got)
+	}
+	if got := countryCode(countryNone); got != "None" {
+		t.Fatalf("None country code = %q", got)
+	}
 }
 
 func TestRun(t *testing.T) {
@@ -401,35 +524,16 @@ func TestRun(t *testing.T) {
 	exitProcess = func(code int) { exitCode = code }
 
 	runApplication = func() error { return nil }
-	run()
+	ES()
 	if exitCode != 0 {
 		t.Fatalf("unexpected exit code %d", exitCode)
 	}
 
 	runApplication = func() error { return errors.New("boom") }
-	run()
+	ES()
 	if exitCode != 1 {
 		t.Fatalf("exit code = %d, want 1", exitCode)
 	}
-}
-
-func TestMainAndDefaultListenTCP(t *testing.T) {
-	oldRun := runApplication
-	oldExit := exitProcess
-	defer func() {
-		runApplication = oldRun
-		exitProcess = oldExit
-	}()
-
-	runApplication = func() error { return nil }
-	exitProcess = func(int) { t.Fatal("main unexpectedly exited") }
-	main()
-
-	ln, err := listenTCP("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("default listenTCP: %v", err)
-	}
-	_ = ln.Close()
 }
 
 func TestRunServer(t *testing.T) {
@@ -629,6 +733,40 @@ func TestLookupAllocations(t *testing.T) {
 	}
 }
 
+func lookupV4FullBinary(ranges []v4Range, addr uint32) (v4Range, bool) {
+	lo, hi := 0, len(ranges)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if ranges[mid].start <= addr {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return v4Range{}, false
+	}
+	r := ranges[lo-1]
+	return r, addr <= r.end
+}
+
+func lookupV6FullBinary(ranges []v6Range, addr uint128) (v6Range, bool) {
+	lo, hi := 0, len(ranges)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if compare128(ranges[mid].start, addr) <= 0 {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo == 0 {
+		return v6Range{}, false
+	}
+	r := ranges[lo-1]
+	return r, compare128(addr, r.end) <= 0
+}
+
 func BenchmarkLookupIPv4(b *testing.B) {
 	db, err := loadDatabaseFS(dataFS, dataPath)
 	if err != nil {
@@ -648,6 +786,25 @@ func BenchmarkLookupIPv4(b *testing.B) {
 	}
 }
 
+func BenchmarkLookupIPv4FullBinary(b *testing.B) {
+	db, err := loadDatabaseFS(dataFS, dataPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(db.v4) == 0 {
+		b.Fatal("no IPv4 ranges")
+	}
+	target := db.v4[len(db.v4)/2].start
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := lookupV4FullBinary(db.v4, target); !ok {
+			b.Fatal("lookup miss")
+		}
+	}
+}
+
 func BenchmarkLookupIPv6(b *testing.B) {
 	db, err := loadDatabaseFS(dataFS, dataPath)
 	if err != nil {
@@ -662,6 +819,25 @@ func BenchmarkLookupIPv6(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, ok := db.lookupV6(target); !ok {
+			b.Fatal("lookup miss")
+		}
+	}
+}
+
+func BenchmarkLookupIPv6FullBinary(b *testing.B) {
+	db, err := loadDatabaseFS(dataFS, dataPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if len(db.v6) == 0 {
+		b.Fatal("no IPv6 ranges")
+	}
+	target := db.v6[len(db.v6)/2].start
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, ok := lookupV6FullBinary(db.v6, target); !ok {
 			b.Fatal("lookup miss")
 		}
 	}
@@ -691,9 +867,12 @@ func BenchmarkHTTPIP(b *testing.B) {
 }
 
 func BenchmarkLoadEmbeddedDatabase(b *testing.B) {
+	if info, err := fs.Stat(dataFS, dataPath); err == nil {
+		b.SetBytes(info.Size())
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		b.StartTimer()
 		db, err := loadDatabaseFS(dataFS, dataPath)
 		if err != nil {
 			b.Fatal(err)

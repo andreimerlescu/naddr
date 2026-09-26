@@ -1,4 +1,4 @@
-package main
+package ess
 
 import (
 	"bufio"
@@ -28,8 +28,13 @@ const (
 	dataPath          = "tsv/ip2asn-combined.tsv"
 	defaultListenAddr = "127.0.0.1:8080"
 
-	v4CapacityHint = 540_000
-	v6CapacityHint = 185_000
+	v4CapacityHint   = 540_000
+	v6CapacityHint   = 185_000
+	metaCapacityHint = 100_000
+	descCapacityHint = 100_000
+
+	prefix16Buckets = 1 << 16
+	countryNone     = uint16(0)
 
 	maxTSVLineBytes = 64 << 10
 )
@@ -41,8 +46,6 @@ var gracefulShutdownTimeout = 5 * time.Second
 //go:embed tsv/ip2asn-combined.tsv
 var dataFS embed.FS
 
-// These private indirections keep operating-system edges testable without
-// changing the production API or adding test-only behavior.
 var (
 	applicationFS fs.FS = dataFS
 
@@ -56,8 +59,8 @@ var (
 	runApplication = runServer
 )
 
-// run is intentionally the only function called by main().
-func run() {
+// ES is intentionally the only function called by main().
+func ES() {
 	if err := runApplication(); err != nil {
 		slog.Error("naddr stopped", "error", err)
 		exitProcess(1)
@@ -67,12 +70,39 @@ func run() {
 type database struct {
 	v4 []v4Range
 	v6 []v6Range
+
+	// Prefix directories hold the first range whose start address is at or
+	// beyond each /16 boundary. lookupV4/lookupV6 also inspect the immediately
+	// preceding range because a range may cross a /16 boundary.
+	v4Index [prefix16Buckets + 1]uint32
+	v6Index [prefix16Buckets + 1]uint32
+
+	// Ranges point to metadata instead of storing ASN data redundantly.
+	meta         []asnMeta
+	descriptions []string
+}
+
+type databaseBuilder struct {
+	db *database
+
+	descIDs map[string]uint32
+	metaIDs map[asnMetaKey]uint32
+}
+
+type asnMeta struct {
+	number uint32
+	descID uint32
+}
+
+type asnMetaKey struct {
+	number uint32
+	descID uint32
 }
 
 type v4Range struct {
 	start   uint32
 	end     uint32
-	asn     uint32
+	metaID  uint32
 	country uint16
 	prefix  uint8
 	_       uint8
@@ -86,25 +116,27 @@ type uint128 struct {
 type v6Range struct {
 	start   uint128
 	end     uint128
-	asn     uint32
+	metaID  uint32
 	country uint16
 	prefix  uint8
 	_       uint8
 }
 
 type ipResponse struct {
-	Error   *string `json:"error"`
-	Success bool    `json:"success"`
-	V       int     `json:"v"`
-	Country string  `json:"country"`
-	N       uint32  `json:"n"`
-	ASN     string  `json:"asn"`
-	IP4     string  `json:"ip4"`
-	IP6     string  `json:"ip6"`
-	IP8     string  `json:"ip8"`
-	Range4  string  `json:"range4"`
-	Range6  string  `json:"range6"`
-	Range8  string  `json:"range8"`
+	Error       *string `json:"error"`
+	Success     bool    `json:"success"`
+	V           int     `json:"v"`
+	Country     string  `json:"country"`
+	CountryCode string  `json:"country_code"`
+	N           uint32  `json:"n"`
+	ASN         string  `json:"asn"`
+	Description string  `json:"description"`
+	IP4         string  `json:"ip4"`
+	IP6         string  `json:"ip6"`
+	IP8         string  `json:"ip8"`
+	Range4      string  `json:"range4"`
+	Range6      string  `json:"range6"`
+	Range8      string  `json:"range8"`
 }
 
 type boolResponse struct {
@@ -113,10 +145,12 @@ type boolResponse struct {
 }
 
 func runServer() error {
+	started := time.Now()
 	db, err := loadDatabaseFS(applicationFS, dataPath)
 	if err != nil {
 		return fmt.Errorf("load embedded database: %w", err)
 	}
+	loadTime := time.Since(started)
 
 	addr := strings.TrimSpace(getenv("NADDR_LISTEN"))
 	if addr == "" {
@@ -138,6 +172,9 @@ func runServer() error {
 		"listen", ln.Addr().String(),
 		"ipv4_ranges", len(db.v4),
 		"ipv6_ranges", len(db.v6),
+		"asn_metadata", len(db.meta),
+		"descriptions", len(db.descriptions),
+		"load_ms", float64(loadTime.Microseconds())/1000,
 	)
 
 	return serveUntilDone(ctx, srv, ln)
@@ -200,11 +237,7 @@ func loadDatabaseFS(source fs.FS, path string) (*database, error) {
 }
 
 func loadDatabaseReader(r io.Reader) (*database, error) {
-	db := &database{
-		v4: make([]v4Range, 0, v4CapacityHint),
-		v6: make([]v6Range, 0, v6CapacityHint),
-	}
-
+	builder := newDatabaseBuilder()
 	br := bufio.NewReaderSize(r, maxTSVLineBytes)
 	lineNo := 0
 
@@ -216,7 +249,7 @@ func loadDatabaseReader(r io.Reader) (*database, error) {
 
 		if len(line) > 0 {
 			lineNo++
-			if parseErr := db.parseLine(line, lineNo); parseErr != nil {
+			if parseErr := builder.parseLine(line, lineNo); parseErr != nil {
 				return nil, parseErr
 			}
 		}
@@ -229,14 +262,38 @@ func loadDatabaseReader(r io.Reader) (*database, error) {
 		}
 	}
 
-	if len(db.v4) == 0 && len(db.v6) == 0 {
+	if len(builder.db.v4) == 0 && len(builder.db.v6) == 0 {
 		return nil, errors.New("TSV contained no address ranges")
 	}
 
-	return db, nil
+	return builder.finish(), nil
 }
 
-func (db *database) parseLine(line []byte, lineNo int) error {
+func newDatabaseBuilder() *databaseBuilder {
+	return &databaseBuilder{
+		db: &database{
+			v4:           make([]v4Range, 0, v4CapacityHint),
+			v6:           make([]v6Range, 0, v6CapacityHint),
+			meta:         make([]asnMeta, 0, metaCapacityHint),
+			descriptions: make([]string, 0, descCapacityHint),
+		},
+		descIDs: make(map[string]uint32, descCapacityHint),
+		metaIDs: make(map[asnMetaKey]uint32, metaCapacityHint),
+	}
+}
+
+func (b *databaseBuilder) finish() *database {
+	buildV4Prefix16Index(b.db)
+	buildV6Prefix16Index(b.db)
+
+	// The dedup maps are startup-only. Dropping references allows GC to reclaim
+	// them while the immutable compact slices remain live for serving requests.
+	b.descIDs = nil
+	b.metaIDs = nil
+	return b.db
+}
+
+func (b *databaseBuilder) parseLine(line []byte, lineNo int) error {
 	line = bytes.TrimSuffix(line, []byte{'\n'})
 	line = bytes.TrimSuffix(line, []byte{'\r'})
 
@@ -256,10 +313,18 @@ func (db *database) parseLine(line []byte, lineNo int) error {
 	if !ok {
 		return fmt.Errorf("line %d: missing AS_number", lineNo)
 	}
-	countryField, _, ok := cutTab(rest)
+	countryField, descriptionField, ok := cutTab(rest)
 	if !ok {
 		return fmt.Errorf("line %d: missing AS_description column", lineNo)
 	}
+
+	// Be tolerant of field padding in upstream/generated TSVs. In particular,
+	// " None " is the same country sentinel as "None".
+	startField = bytes.TrimSpace(startField)
+	endField = bytes.TrimSpace(endField)
+	asnField = bytes.TrimSpace(asnField)
+	countryField = bytes.TrimSpace(countryField)
+	descriptionField = bytes.TrimSpace(descriptionField)
 
 	if bytes.Equal(startField, []byte("range_start")) {
 		return nil
@@ -276,7 +341,6 @@ func (db *database) parseLine(line []byte, lineNo int) error {
 
 	start = start.Unmap()
 	end = end.Unmap()
-
 	if start.Is4() != end.Is4() {
 		return fmt.Errorf("line %d: address families differ", lineNo)
 	}
@@ -291,20 +355,23 @@ func (db *database) parseLine(line []byte, lineNo int) error {
 		return fmt.Errorf("line %d: invalid country_code: %w", lineNo, err)
 	}
 
+	descID := b.internDescription(descriptionField)
+	metaID := b.internMeta(asn, descID)
+
 	if start.Is4() {
 		s := ipv4Uint32(start)
 		e := ipv4Uint32(end)
 		if s > e {
 			return fmt.Errorf("line %d: reversed IPv4 range", lineNo)
 		}
-		if n := len(db.v4); n > 0 && s <= db.v4[n-1].end {
+		if n := len(b.db.v4); n > 0 && s <= b.db.v4[n-1].end {
 			return fmt.Errorf("line %d: IPv4 ranges are unsorted or overlapping", lineNo)
 		}
 
-		db.v4 = append(db.v4, v4Range{
+		b.db.v4 = append(b.db.v4, v4Range{
 			start:   s,
 			end:     e,
-			asn:     asn,
+			metaID:  metaID,
 			country: country,
 			prefix:  exactV4Prefix(s, e),
 		})
@@ -316,18 +383,45 @@ func (db *database) parseLine(line []byte, lineNo int) error {
 	if compare128(s, e) > 0 {
 		return fmt.Errorf("line %d: reversed IPv6 range", lineNo)
 	}
-	if n := len(db.v6); n > 0 && compare128(s, db.v6[n-1].end) <= 0 {
+	if n := len(b.db.v6); n > 0 && compare128(s, b.db.v6[n-1].end) <= 0 {
 		return fmt.Errorf("line %d: IPv6 ranges are unsorted or overlapping", lineNo)
 	}
 
-	db.v6 = append(db.v6, v6Range{
+	b.db.v6 = append(b.db.v6, v6Range{
 		start:   s,
 		end:     e,
-		asn:     asn,
+		metaID:  metaID,
 		country: country,
 		prefix:  exactV6Prefix(s, e),
 	})
 	return nil
+}
+
+func (b *databaseBuilder) internDescription(raw []byte) uint32 {
+	// The temporary []byte->string conversion used only for map probing does
+	// not escape in current Go compilers. Allocate a durable string only on a
+	// genuine miss so duplicate descriptions are stored exactly once.
+	if id, ok := b.descIDs[string(raw)]; ok {
+		return id
+	}
+
+	value := string(raw)
+	id := uint32(len(b.db.descriptions))
+	b.db.descriptions = append(b.db.descriptions, value)
+	b.descIDs[value] = id
+	return id
+}
+
+func (b *databaseBuilder) internMeta(asn, descID uint32) uint32 {
+	key := asnMetaKey{number: asn, descID: descID}
+	if id, ok := b.metaIDs[key]; ok {
+		return id
+	}
+
+	id := uint32(len(b.db.meta))
+	b.db.meta = append(b.db.meta, asnMeta{number: asn, descID: descID})
+	b.metaIDs[key] = id
+	return id
 }
 
 func cutTab(b []byte) (head, tail []byte, ok bool) {
@@ -357,8 +451,12 @@ func parseUint32(b []byte) (uint32, error) {
 }
 
 func parseCountryCode(b []byte) (uint16, error) {
+	b = bytes.TrimSpace(b)
+	if bytes.EqualFold(b, []byte("None")) || bytes.EqualFold(b, []byte("Unknown")) {
+		return countryNone, nil
+	}
 	if len(b) != 2 {
-		return 0, errors.New("country code must contain exactly two letters")
+		return 0, errors.New("country code must be a two-letter ISO code or None")
 	}
 
 	a, z := b[0], b[1]
@@ -373,6 +471,13 @@ func parseCountryCode(b []byte) (uint16, error) {
 	}
 
 	return uint16(a)<<8 | uint16(z), nil
+}
+
+func countryCode(code uint16) string {
+	if code == countryNone {
+		return "None"
+	}
+	return string([]byte{byte(code >> 8), byte(code)})
 }
 
 func ipv4Uint32(addr netip.Addr) uint32 {
@@ -449,8 +554,37 @@ func exactV6Prefix(start, end uint128) uint8 {
 	return uint8(prefix)
 }
 
+func buildV4Prefix16Index(db *database) {
+	cursor := 0
+	for bucket := 0; bucket < prefix16Buckets; bucket++ {
+		for cursor < len(db.v4) && int(db.v4[cursor].start>>16) < bucket {
+			cursor++
+		}
+		db.v4Index[bucket] = uint32(cursor)
+	}
+	db.v4Index[prefix16Buckets] = uint32(len(db.v4))
+}
+
+func buildV6Prefix16Index(db *database) {
+	cursor := 0
+	for bucket := 0; bucket < prefix16Buckets; bucket++ {
+		for cursor < len(db.v6) && int(db.v6[cursor].start.hi>>48) < bucket {
+			cursor++
+		}
+		db.v6Index[bucket] = uint32(cursor)
+	}
+	db.v6Index[prefix16Buckets] = uint32(len(db.v6))
+}
+
 func (db *database) lookupV4(addr uint32) (v4Range, bool) {
-	lo, hi := 0, len(db.v4)
+	bucket := int(addr >> 16)
+	lo := int(db.v4Index[bucket])
+	hi := int(db.v4Index[bucket+1])
+	if lo > 0 {
+		lo--
+	}
+
+	base := lo
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
 		if db.v4[mid].start <= addr {
@@ -459,7 +593,7 @@ func (db *database) lookupV4(addr uint32) (v4Range, bool) {
 			hi = mid
 		}
 	}
-	if lo == 0 {
+	if lo == base {
 		return v4Range{}, false
 	}
 	r := db.v4[lo-1]
@@ -467,7 +601,14 @@ func (db *database) lookupV4(addr uint32) (v4Range, bool) {
 }
 
 func (db *database) lookupV6(addr uint128) (v6Range, bool) {
-	lo, hi := 0, len(db.v6)
+	bucket := int(addr.hi >> 48)
+	lo := int(db.v6Index[bucket])
+	hi := int(db.v6Index[bucket+1])
+	if lo > 0 {
+		lo--
+	}
+
+	base := lo
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
 		if compare128(db.v6[mid].start, addr) <= 0 {
@@ -476,11 +617,19 @@ func (db *database) lookupV6(addr uint128) (v6Range, bool) {
 			hi = mid
 		}
 	}
-	if lo == 0 {
+	if lo == base {
 		return v6Range{}, false
 	}
 	r := db.v6[lo-1]
 	return r, compare128(addr, r.end) <= 0
+}
+
+func (db *database) metadata(metaID uint32) asnMeta {
+	return db.meta[metaID]
+}
+
+func (db *database) description(meta asnMeta) string {
+	return db.descriptions[meta.descID]
 }
 
 func newHandler(db *database) http.Handler {
@@ -627,8 +776,6 @@ func requesterAddr(r *http.Request) (netip.Addr, error) {
 		return netip.Addr{}, errors.New("invalid remote address")
 	}
 
-	// Proxy headers are trusted only from loopback peers. The default service
-	// binds to 127.0.0.1, so a local reverse proxy can safely provide /my.
 	if !remote.IsLoopback() {
 		return remote, nil
 	}
@@ -652,42 +799,46 @@ func requesterAddr(r *http.Request) (netip.Addr, error) {
 
 func writeLookup(w http.ResponseWriter, db *database, addr netip.Addr, cacheControl string) {
 	if addr.Is4() {
-		raw := ipv4Uint32(addr)
-		r, ok := db.lookupV4(raw)
+		r, ok := db.lookupV4(ipv4Uint32(addr))
 		if !ok {
 			writeIPError(w, http.StatusNotFound, "address not found")
 			return
 		}
+		meta := db.metadata(r.metaID)
 
 		writeJSON(w, http.StatusOK, cacheControl, ipResponse{
-			Error:   nil,
-			Success: true,
-			V:       4,
-			Country: countryName(r.country),
-			N:       r.asn,
-			ASN:     "AS" + strconv.FormatUint(uint64(r.asn), 10),
-			IP4:     addr.String(),
-			Range4:  formatV4Range(r),
+			Error:       nil,
+			Success:     true,
+			V:           4,
+			Country:     countryName(r.country),
+			CountryCode: countryCode(r.country),
+			N:           meta.number,
+			ASN:         "AS" + strconv.FormatUint(uint64(meta.number), 10),
+			Description: db.description(meta),
+			IP4:         addr.String(),
+			Range4:      formatV4Range(r),
 		})
 		return
 	}
 
-	raw := uint128FromAddr(addr)
-	r, ok := db.lookupV6(raw)
+	r, ok := db.lookupV6(uint128FromAddr(addr))
 	if !ok {
 		writeIPError(w, http.StatusNotFound, "address not found")
 		return
 	}
+	meta := db.metadata(r.metaID)
 
 	writeJSON(w, http.StatusOK, cacheControl, ipResponse{
-		Error:   nil,
-		Success: true,
-		V:       6,
-		Country: countryName(r.country),
-		N:       r.asn,
-		ASN:     "AS" + strconv.FormatUint(uint64(r.asn), 10),
-		IP6:     addr.String(),
-		Range6:  formatV6Range(r),
+		Error:       nil,
+		Success:     true,
+		V:           6,
+		Country:     countryName(r.country),
+		CountryCode: countryCode(r.country),
+		N:           meta.number,
+		ASN:         "AS" + strconv.FormatUint(uint64(meta.number), 10),
+		Description: db.description(meta),
+		IP6:         addr.String(),
+		Range6:      formatV6Range(r),
 	})
 }
 
@@ -740,6 +891,9 @@ func writeJSON(w http.ResponseWriter, status int, cacheControl string, value any
 }
 
 func countryName(code uint16) string {
+	if code == countryNone {
+		return "Unknown"
+	}
 	if name, ok := countryNames[code]; ok {
 		return name
 	}
